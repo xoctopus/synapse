@@ -8,7 +8,7 @@ The core component, **Synapse**, acts as a controlled container for asynchronous
 
 * **Wrapping context**: Separates the **Parent context** (metadata/inherited signals) from the **Dispatched context** (internal lifecycle control).
 * **Go 1.24 Integration**: Leverages `sync.WaitGroup.Go` for automatic task tracking and standardized **panic propagation**.
-* **Shutdown Orchestration**: Provides a thread-safe `Close` mechanism with optional timeout protection to prevent blocking the main process indefinitely.
+* **Shutdown Orchestration**: Provides a thread-safe `Cancel` mechanism with optional timeout protection to prevent blocking the main process indefinitely.
 
 ## Usage Example
 
@@ -25,7 +25,7 @@ s.Spawn(func(ctx context.Context) {
 })
 
 // Gracefully stop all workers and wait for completion
-if err := s.Close(nil); err != nil {
+if err := s.Cancel(nil); err != nil {
     log.Printf("Shutdown failed: %v", err)
 }
 ```

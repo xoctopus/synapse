@@ -2,57 +2,79 @@ package synapse
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/xoctopus/x/codex"
-	"github.com/xoctopus/x/misc/must"
 )
 
-func New(ctx context.Context, appliers ...OptionApplier) *Synapse {
-	x := &Synapse{inherited: ctx}
+type Synapse interface {
+	context.Context
+
+	Spawn(func(context.Context)) error
+	Cancel(error)
+}
+
+func NewSynapse(ctx context.Context, appliers ...OptionApplier) Synapse {
+	x := &synapse{
+		inherited: ctx,
+		done:      make(chan struct{}),
+	}
+
 	for _, applier := range appliers {
 		applier(&x.option)
 	}
 
-	if x.cancelCause == nil {
-		x.cancelCause = context.Canceled
-	}
+	x.dispatched, x.cancel = context.WithCancelCause(ctx)
 
-	switch x.cancelMode {
-	case withCancelTimeout:
-		must.BeTrueF(x.cancelTimeout > 0, "invalid timeout")
-		x.dispatched, x.cancel = context.WithTimeoutCause(ctx, x.cancelTimeout, x.cancelCause)
-	case withCancelDeadline:
-		x.dispatched, x.cancel = context.WithDeadlineCause(ctx, x.cancelDeadline, x.cancelCause)
-	default:
-		x.dispatched, x.cancel = context.WithCancelCause(ctx)
-	}
+	go func() {
+		var cause error
+		select {
+		case <-x.inherited.Done():
+			cause = context.Cause(x.inherited)
+		case <-x.dispatched.Done():
+			cause = context.Cause(x.dispatched)
+		}
+		x.Cancel(cause)
+	}()
+
 	return x
 }
 
-type Synapse struct {
+type synapse struct {
 	option
 
 	inherited  context.Context
-	cancel     any
+	cancel     context.CancelCauseFunc
 	dispatched context.Context
 
 	mu       sync.Mutex
 	wg       sync.WaitGroup
 	canceled atomic.Bool
+	err      error
+	done     chan struct{}
 }
 
-func (x *Synapse) Parent() context.Context {
-	return x.inherited
+func (x *synapse) Deadline() (time.Time, bool) {
+	return x.dispatched.Deadline()
 }
 
-func (x *Synapse) Value(key any) any {
-	return x.inherited.Value(key)
+func (x *synapse) Done() <-chan struct{} {
+	return x.done
 }
 
-func (x *Synapse) Spawn(f func(ctx context.Context)) error {
+func (x *synapse) Err() error {
+	<-x.Done()
+	return x.err
+}
+
+func (x *synapse) Value(key any) any {
+	return x.dispatched.Value(key)
+}
+
+func (x *synapse) Spawn(f func(ctx context.Context)) error {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	if !x.canceled.Load() {
@@ -64,16 +86,29 @@ func (x *Synapse) Spawn(f func(ctx context.Context)) error {
 	return codex.New(ERROR__SYNAPSE_CLOSED)
 }
 
-func (x *Synapse) Close(cause error) error {
+func (x *synapse) Cancel(cause error) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	if x.canceled.CompareAndSwap(false, true) {
-		switch cancel := x.cancel.(type) {
-		case context.CancelFunc:
-			cancel()
-		case context.CancelCauseFunc:
-			cancel(cause)
+		ctx, cancel := context.WithCancel(context.Background())
+		if x.shutdownTimeout > 0 {
+			ctx, cancel = context.WithTimeout(ctx, x.shutdownTimeout)
 		}
+		var err error
+		defer func() {
+			cancel()
+			x.err = errors.Join(err, cause)
+			if x.afterCloseFunc != nil {
+				x.err = errors.Join(x.err, x.afterCloseFunc(x.err))
+			}
+			close(x.done)
+		}()
+
+		if x.beforeCloseFunc != nil {
+			x.beforeCloseFunc(ctx)
+		}
+
+		x.cancel(cause)
 
 		if x.shutdownTimeout > 0 {
 			sig := make(chan struct{})
@@ -85,12 +120,48 @@ func (x *Synapse) Close(cause error) error {
 
 			select {
 			case <-sig:
-				return nil
+				return
 			case <-time.After(x.shutdownTimeout):
-				return codex.New(ERROR__SYNAPSE_CLOSE_TIMEOUT)
+				err = codex.New(ERROR__SYNAPSE_CLOSE_TIMEOUT)
+				return
 			}
 		}
 		x.wg.Wait()
 	}
-	return nil
+}
+
+type option struct {
+	shutdownTimeout time.Duration
+	beforeCloseFunc func(context.Context)
+	afterCloseFunc  func(error) error
+}
+
+type OptionApplier func(*option)
+
+func WithShutdownTimeout(timeout time.Duration) OptionApplier {
+	return func(o *option) {
+		o.shutdownTimeout = timeout
+	}
+}
+
+// WithBeforeCloseFunc registers a hook that executes before the Synapse.Cancel
+// process begins. The provided context is canceled either when all goroutines
+// have finished or once the shutdownTimeout is reached if configurated.
+// This is typically used to signal or wake up suspended goroutines (e.g., via sync.Cond).
+// Note: The implementation of this function must decide whether to operate
+// synchronously or asynchronously.
+func WithBeforeCloseFunc(beforeCloseFunc func(context.Context)) OptionApplier {
+	return func(o *option) {
+		o.beforeCloseFunc = beforeCloseFunc
+	}
+}
+
+// WithAfterCloseFunc registers a post-close hook.
+// ensures afterCloseFunc is invoked after all goroutines exited, providing
+// synchronous waiting for Synapse.Cancel.
+// The err parameter passed to indicates why the shutdown was triggered (eg: context.Cause).
+func WithAfterCloseFunc(afterCloseFunc func(error) error) OptionApplier {
+	return func(o *option) {
+		o.afterCloseFunc = afterCloseFunc
+	}
 }
